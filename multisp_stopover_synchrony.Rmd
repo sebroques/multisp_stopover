@@ -1,0 +1,170 @@
+---
+title: "Nimble code to run the multi-species capture-recapture model to explore synchrony in departure probability"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=T, eval=FALSE}
+
+library(nimble)
+
+
+## load capture histories
+load('CH_ACRSCH_DONGES9_14')
+load('CH_ACRSCI_DONGES9_14')
+load('CH_LUSSVE_DONGES9_14')
+
+# load year vectors
+
+load('year_ACRSCH_DONGES9_14')
+load('year_ACRSCI_DONGES9_14')
+load('year_LUSSVE_DONGES9_14')
+
+## Nimble code
+
+code <- nimbleCode({
+  ## Priors for sd and sd2
+
+    sd.d ~ dunif(0, 10)
+    sigma2.d <- sd.d^2
+    for (esp in 1:3){
+      sd.eSp[esp] ~ dunif(0, 10)
+      sigma2.eSp[esp] <- sd.eSp[esp]^2
+    }
+  
+  
+  ## intercept and TSA slope per species
+  for(esp in 1:3) {
+    b[esp]~  dnorm(0, 0.1)
+    for (yrs in 1:6){
+      a[yrs,esp] ~ dnorm(0, 0.1)
+    }
+  }
+  ## Priors for phi.est, eta , time and species specific random terms
+  for (yrs in 1:(nbyears)){
+    for(t in 1:(n.occasions)) {
+      delta[yrs,t] ~ dnorm(0, sd = sd.d) 
+      ## Species-specific random effect terms
+      for(esp in 1:3) {
+        p[yrs,t,esp] ~ dunif(0, 1)
+        eta[yrs,t,esp] ~ dunif(0, 1)
+        epsilon[yrs,t,esp] ~ dnorm(0, sd = sd.eSp[esp]) 
+      }
+      
+    }
+  }
+  
+  for (i in 1:M) {
+    for (t in 1:n.occasions){
+      logit(phi.est[i,t]) <- a[year[i],sp[i]]  + b[sp[i]]*TSA[i,t]+ delta[year[i],t] + epsilon[year[i],t,sp[i]]
+    }
+  }
+  
+  
+  ## Likelihood
+  for(i in 1:M) {
+    ## First occasion
+    z[i,1] ~ dbern(eta[year[i],1,sp[i]])
+    prod1mz[i,1] <- 1 
+    TSA[i,1] <- z[i,1]
+    ## Observation process
+    mup[i,1] <- z[i,1] * p[year[i],1,sp[i]] 
+    y[i,1] ~ dbern(mup[i,1])
+    ## Subsequent occasions
+    for (t in 2:n.occasions) {
+      ## State process
+      prod1mz[i,t] <- prod1mz[i,t-1] * (1 - z[i,t-1])
+      TSA[i,t] <- TSA[i,t-1]+z[i,t]
+      mu[i,t] <- phi.est[i,t-1] * z[i,t-1] + eta[year[i],t,sp[i]] * prod1mz[i,t]
+      z[i,t] ~ dbern(mu[i,t])
+      ## Observation process
+      mup[i,t] <- z[i,t] * p[year[i],t,sp[i]] 
+      y[i,t] ~ dbern(mup[i,t])
+    }
+  }
+  ## stopover duration 
+  for (i in 1:M) {
+    stp[i] <- sum(z[i,1:n.occasions]) 
+  }
+  zes <- mean(stp[1:M])   
+  
+})
+
+
+
+
+known_state_ch <- function(ch) {
+  state <- ch
+  for (i in 1:dim(ch)[1]){
+    if(sum(ch[i,])!=0){
+      n1 <- min(which(ch[i,]==1)) 
+      n2 <- max(which(ch[i,]==1)) 
+      state[i,n1:n2] <- 1 
+      
+    }
+  }
+  state[state==0] <- 0 
+  return(state)
+}
+
+
+
+# bind capture histories and year vectors
+lCH <- rbind(CH_ACRSCH_DONGES9_14, CH_ACRSCI_DONGES9_14,CH_LUSSVE_DONGES9_14)
+lyear<-c(year_ACRSCH_DONGES9_14,year_ACRSCI_DONGES9_14,year_LUSSVE_DONGES9_14 )
+
+sp <- c(rep(1, dim(CH_ACRSCH_DONGES9_14)[1]),
+        rep(2, dim(CH_ACRSCI_DONGES9_14)[1]),
+        rep(3, dim(CH_LUSSVE_DONGES9_14)[1]))
+
+
+M <- dim(lCH)[1]
+n.occasions <- dim(lCH)[2]
+z.init <- known_state_ch(lCH)
+
+constants <- list(M = M, n.occasions = n.occasions, sp = sp, year=lyear, nbyears=length(unique(lyear)))
+
+data <- list(y = lCH)
+
+inits <- list(sd.d = 1,
+              a = matrix(1,6,3),
+              b = rep(1,3),
+              sd.eSp = rep(1,3),
+              delta = matrix(0,length(unique(lyear)),n.occasions),
+              p = array(0.5, c(length(unique(lyear)),n.occasions,3)),
+              eta = array(0.5, c(length(unique(lyear)),n.occasions,3)),
+              epsilon = array(0, c(length(unique(lyear)),n.occasions,3)),
+              z = z.init)
+
+
+Rmodel <- nimbleModel(code, constants, data, inits) 
+Rmodel$calculate()  
+
+
+
+
+params <- c('sd.d', 'a','b', 'sd.eSp', 'zes')
+
+conf <- configureMCMC(Rmodel, monitors = params)
+
+Rmcmc <- buildMCMC(conf)
+
+Cmodel <- compileNimble(Rmodel)
+Cmcmc <- compileNimble(Rmcmc, project = Rmodel)
+if(FALSE) {
+  compiledList <- compileNimble(list(model=Rmodel, mcmc=Rmcmc))
+  Cmodel <- compiledList$model; Cmcmc <- compiledList$mcmc
+}
+
+ni <- 300000
+nt <- 1
+nb <- 200000
+nc <- 1
+
+set.seed(0)
+
+system.time(samples <- runMCMC(Cmcmc, niter = ni, thin = nt, nburnin = nb, nchains = nc))
+```
+
+
